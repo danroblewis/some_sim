@@ -7,6 +7,28 @@
   <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone@7.26.0/babel.min.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; background: #f5f6f8; color: #222; margin: 0; }
+    main { max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
+    .card { background: #fff; border: 1px solid #dde; border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
+    .card.blocked { background: #fafafa; border-style: dashed; }
+    .row { display: flex; align-items: center; gap: 8px; }
+    .row .grow { flex: 1; }
+    .done .title { text-decoration: line-through; color: #888; }
+    .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; }
+    .badge.blocked { background: #ffe9d6; color: #a04a00; }
+    .badge.ready { background: #dcf5e1; color: #1c6b30; }
+    .badge.done { background: #e6e6e6; color: #555; }
+    .deps { margin: 8px 0 0 26px; font-size: 13px; }
+    .chip { display: inline-flex; align-items: center; gap: 4px; background: #eef; border-radius: 12px; padding: 2px 4px 2px 10px; margin: 2px 4px 2px 0; }
+    .chip.done { background: #e3f4e6; text-decoration: line-through; color: #567; }
+    .chip button { border: 0; background: none; cursor: pointer; color: #667; }
+    .picker { margin: 8px 0; padding: 8px 10px; background: #fff; border: 1px solid #dde; border-radius: 8px; font-size: 14px; }
+    .picker label { display: block; padding: 2px 0; }
+    input[type=text] { padding: 8px; font-size: 15px; }
+    button.primary { padding: 8px 14px; font-size: 15px; }
+    .muted { color: #777; font-size: 13px; }
+  </style>
 </head>
 <body>
   <div id="root"></div>
@@ -22,66 +44,94 @@
       method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
     });
 
+    function DepPicker({ options, selected, onChange }) {
+      if (options.length === 0) return <p className="muted">No other todos to depend on yet.</p>;
+      return (
+        <div className="picker">
+          {options.map((o) => (
+            <label key={o.id}>
+              <input type="checkbox" checked={selected.includes(o.id)}
+                onChange={(e) => onChange(e.target.checked ? [...selected, o.id] : selected.filter((x) => x !== o.id))} />{" "}
+              #{o.id} {o.text} {o.done && <span className="muted">(done)</span>}
+            </label>
+          ))}
+        </div>
+      );
+    }
+
+    function TodoCard({ t, todos, byId, onToggle, onRemove, onSetDeps }) {
+      const [editing, setEditing] = useState(false);
+      const pending = t.depends_on.filter((d) => byId[d] && !byId[d].done);
+      const blocked = pending.length > 0;
+      const status = t.done ? "done" : blocked ? "blocked" : "ready";
+      const options = todos.filter((o) => o.id !== t.id);
+      return (
+        <div className={`card ${t.done ? "done" : ""} ${blocked && !t.done ? "blocked" : ""}`}>
+          <div className="row">
+            <input type="checkbox" checked={t.done} disabled={blocked && !t.done}
+              title={blocked ? "Complete its dependencies first" : ""} onChange={() => onToggle(t.id)} />
+            <span className="title grow">#{t.id} {t.text}</span>
+            <span className={`badge ${status}`}>
+              {status === "blocked" ? `blocked by ${pending.length}` : status}
+            </span>
+            <button onClick={() => setEditing(!editing)}>{editing ? "Close" : "Dependencies"}</button>
+            <button onClick={() => onRemove(t.id)} title="Delete">✕</button>
+          </div>
+          {(t.depends_on.length > 0 || editing) && (
+            <div className="deps">
+              <span className="muted">Depends on: </span>
+              {t.depends_on.length === 0 && <span className="muted">nothing</span>}
+              {t.depends_on.map((d) => (
+                <span key={d} className={`chip ${byId[d]?.done ? "done" : ""}`}>
+                  #{d} {byId[d]?.text}
+                  <button title="Remove dependency" onClick={() => onSetDeps(t.id, t.depends_on.filter((x) => x !== d))}>×</button>
+                </span>
+              ))}
+              {editing && <DepPicker options={options} selected={t.depends_on} onChange={(deps) => onSetDeps(t.id, deps)} />}
+            </div>
+          )}
+        </div>
+      );
+    }
+
     function App() {
       const [todos, setTodos] = useState([]);
       const [text, setText] = useState("");
+      const [newDeps, setNewDeps] = useState([]);
+      const [pickDeps, setPickDeps] = useState(false);
       const load = () => api("/todos").then((d) => d && setTodos(d));
-      const byId = Object.fromEntries(todos.map((t) => [t.id, t]));
       useEffect(() => { load(); }, []);
+      const byId = Object.fromEntries(todos.map((t) => [t.id, t]));
 
       const add = async (e) => {
         e.preventDefault();
         if (!text.trim()) return;
-        await api("/todos", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text }),
-        });
-        setText("");
+        const created = await api("/todos", json("POST", { text }));
+        if (created && newDeps.length) await api(`/todos/${created.id}/dependencies`, json("PUT", newDeps));
+        setText(""); setNewDeps([]); setPickDeps(false);
         load();
       };
       const toggle = (id) => api(`/todos/${id}/toggle`, { method: "POST" }).then(load);
-      const setDeps = (t, deps) => api(`/todos/${t.id}/dependencies`, json("PUT", deps)).then(load);
       const remove = (id) => api(`/todos/${id}`, { method: "DELETE" }).then(load);
+      const setDeps = (id, deps) => api(`/todos/${id}/dependencies`, json("PUT", deps)).then(load);
 
       return (
-        <main style={{ maxWidth: 480, margin: "3rem auto", fontFamily: "system-ui" }}>
+        <main>
           <h1>some_sim todos</h1>
           <form onSubmit={add}>
-            <input value={text} onChange={(e) => setText(e.target.value)} placeholder="What needs doing?" />
-            <button>Add</button>
+            <div className="row">
+              <input type="text" className="grow" value={text} onChange={(e) => setText(e.target.value)} placeholder="What needs doing?" />
+              <button type="button" onClick={() => setPickDeps(!pickDeps)}>
+                Dependencies{newDeps.length ? ` (${newDeps.length})` : ""}
+              </button>
+              <button className="primary">Add</button>
+            </div>
+            {pickDeps && <DepPicker options={todos} selected={newDeps} onChange={setNewDeps} />}
           </form>
-          <ul>
-            {todos.map((t) => {
-              const blocked = t.depends_on.some((d) => byId[d] && !byId[d].done);
-              const options = todos.filter((o) => o.id !== t.id && !t.depends_on.includes(o.id));
-              return (
-                <li key={t.id} style={{ marginBottom: 8 }}>
-                  <label style={{ textDecoration: t.done ? "line-through" : "none", opacity: blocked ? 0.6 : 1 }}>
-                    <input type="checkbox" checked={t.done} disabled={blocked && !t.done}
-                      title={blocked ? "Complete its dependencies first" : ""}
-                      onChange={() => toggle(t.id)} /> #{t.id} {t.text}
-                  </label>{" "}
-                  <button onClick={() => remove(t.id)}>✕</button>
-                  <div style={{ fontSize: 13, marginLeft: 24 }}>
-                    {t.depends_on.length > 0 && <span>depends on: </span>}
-                    {t.depends_on.map((d) => (
-                      <span key={d} style={{ marginRight: 6, textDecoration: byId[d]?.done ? "line-through" : "none" }}>
-                        #{d} {byId[d]?.text}
-                        <button onClick={() => setDeps(t, t.depends_on.filter((x) => x !== d))}>×</button>
-                      </span>
-                    ))}
-                    {options.length > 0 && (
-                      <select value="" onChange={(e) => setDeps(t, [...t.depends_on, Number(e.target.value)])}>
-                        <option value="">+ add dependency…</option>
-                        {options.map((o) => <option key={o.id} value={o.id}>#{o.id} {o.text}</option>)}
-                      </select>
-                    )}
-                  </div>
-                </li>
-              );
-            })}
-          </ul>
+          <p className="muted">A todo can only be completed once everything it depends on is done.</p>
+          {todos.map((t) => (
+            <TodoCard key={t.id} t={t} todos={todos} byId={byId} onToggle={toggle} onRemove={remove} onSetDeps={setDeps} />
+          ))}
         </main>
       );
     }
