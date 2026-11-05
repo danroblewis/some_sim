@@ -41,4 +41,32 @@ The page contains no rules; it renders server state and shows the server's error
 - **Monitor**: the page reloads the todo list and simulator stats every 2s (`POLL_MS` in
   `static/index.html`) and shows whether the server is reachable.
 
+## Metrics (`GET /metrics`, Prometheus text format)
+
+| Metric | What it tells you |
+| --- | --- |
+| `http_requests_total{method,route,status}` | Traffic. `route` is the template (`/api/todos/{todo_id}`), never a raw path. Non-API files are `static`, anything unknown is `unmatched`. |
+| `http_request_duration_seconds` (histogram) | Latency per method and route. |
+| `http_requests_in_flight` | Requests being handled right now. |
+| `todo_rule_rejections_total{rule}` | How often the server refused a request, by the rule that refused it: `complete_blocked`, `delete_has_dependencies`, `reopen_with_completed_dependents`, `open_dependency_on_completed`, `dependency_cycle`, `self_dependency`. |
+| `todo_events_total{event}` | State changes that really happened: `created`, `completed`, `reopened`, `deleted`, `dependencies_changed`. |
+| `todos_current{state}` | Todos right now: `ready`, `blocked`, `done`. |
+| `todo_dependency_links`, `todo_longest_dependency_chain` | Size and depth of the dependency graph. |
+| `simulator_running`, `simulator_requests_total{action,outcome}` | The traffic simulator (outcome is `ok`, `rejected` for 4xx, or `error`). Resets when the simulator is restarted. |
+| `todoapp_start_time_seconds` | Process start time (use it to detect restarts). |
+
+Counters start at 0 on every server start; the `todos_*` gauges are computed from the database
+at scrape time, so they are correct right after a restart. Scrapes of `/metrics` are not counted.
+
+```yaml
+# prometheus.yml
+scrape_configs:
+  - job_name: todos
+    static_configs: [{targets: ["localhost:8000"]}]
+```
+
+Handy queries: `sum by (route, status) (rate(http_requests_total[1m]))`,
+`histogram_quantile(0.95, sum by (le, route) (rate(http_request_duration_seconds_bucket[5m])))`,
+`sum by (rule) (rate(todo_rule_rejections_total[5m]))`, `todos_current`.
+
 Tests: `pip install -r requirements-dev.txt && pytest`

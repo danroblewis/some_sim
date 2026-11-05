@@ -15,13 +15,15 @@ server returns and shows the server's error messages. The rules:
 import os
 import sqlite3
 import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
 
+from metrics import CONTENT_TYPE_LATEST, Metrics
 from simulator import Simulator
 
 DEFAULT_DB = Path(os.environ.get("TODOS_DB", Path(__file__).parent / "data" / "todos.db"))
@@ -41,15 +43,36 @@ CREATE TABLE IF NOT EXISTS dependency (
 """
 
 
+RULES = (
+    "complete_blocked",                  # completing a todo whose dependencies aren't all done
+    "reopen_with_completed_dependents",  # re-opening a todo that a completed todo depends on
+    "open_dependency_on_completed",      # adding an unfinished dependency to a completed todo
+    "delete_has_dependencies",           # deleting a todo that still has dependencies
+    "dependency_cycle",
+    "self_dependency",
+)
+EVENTS = ("created", "completed", "reopened", "deleted", "dependencies_changed")
+
+
 class NotFound(Exception): ...
-class Invalid(Exception): ...   # bad request (400)
-class Conflict(Exception): ...  # request is well-formed but violates a rule (409)
+
+
+class RuleViolation(Exception):
+    def __init__(self, rule: str, message: str):
+        assert rule in RULES
+        super().__init__(message)
+        self.rule = rule
+
+
+class Invalid(RuleViolation): ...   # bad request (400)
+class Conflict(RuleViolation): ...  # request is well-formed but violates a rule (409)
 
 
 class Store:
     """The only place where the dependency rules are implemented."""
 
-    def __init__(self, path: Path | str):
+    def __init__(self, path: Path | str, on_event=None):
+        self.on_event = on_event or (lambda event: None)  # called after each state change that happened
         if str(path) != ":memory:":
             Path(path).parent.mkdir(parents=True, exist_ok=True)
         self.db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
@@ -110,6 +133,7 @@ class Store:
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
+            self.on_event("created")
             return self.get(new_id)
 
     def set_done(self, todo_id: int, done: bool) -> dict:
@@ -120,15 +144,18 @@ class Store:
             if done:
                 pending = [d for d in deps[todo_id] if not todos[d]["done"]]
                 if pending:
-                    raise Conflict(f"Can't complete: dependencies not done yet: {self._names(todos, pending)}")
+                    raise Conflict("complete_blocked", f"Can't complete: dependencies not done yet: {self._names(todos, pending)}")
             else:
                 reliant = [t for t, ds in deps.items() if todo_id in ds and todos[t]["done"]]
                 if reliant:
                     raise Conflict(
+                        "reopen_with_completed_dependents",
                         f"Can't re-open: completed todos depend on it: {self._names(todos, reliant)}. "
                         "Re-open those first."
                     )
-            self.db.execute("UPDATE todo SET done = ? WHERE id = ?", (int(done), todo_id))
+            if bool(todos[todo_id]["done"]) != done:  # only count real transitions
+                self.db.execute("UPDATE todo SET done = ? WHERE id = ?", (int(done), todo_id))
+                self.on_event("completed" if done else "reopened")
             return self.get(todo_id)
 
     def set_dependencies(self, todo_id: int, new_deps: list[int]) -> dict:
@@ -141,13 +168,14 @@ class Store:
                 if d not in todos:
                     raise NotFound(f"Dependency {d} not found")
                 if d == todo_id:
-                    raise Invalid("A todo can't depend on itself")
+                    raise Invalid("self_dependency", "A todo can't depend on itself")
                 if self._reaches(deps, d, todo_id):
-                    raise Invalid(f"Dependency on '{todos[d]['text']}' would create a cycle")
+                    raise Invalid("dependency_cycle", f"Dependency on '{todos[d]['text']}' would create a cycle")
             if todos[todo_id]["done"]:
                 pending = [d for d in new_deps if not todos[d]["done"]]
                 if pending:
                     raise Conflict(
+                        "open_dependency_on_completed",
                         f"Can't add unfinished dependencies to a completed todo: {self._names(todos, pending)}. "
                         "Re-open it first."
                     )
@@ -162,6 +190,7 @@ class Store:
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
+            self.on_event("dependencies_changed")
             return self.get(todo_id)
 
     def delete(self, todo_id: int) -> None:
@@ -171,6 +200,7 @@ class Store:
                 raise NotFound(f"Todo {todo_id} not found")
             if deps[todo_id]:
                 raise Conflict(
+                    "delete_has_dependencies",
                     f"Can't delete: it has dependencies: {self._names(todos, deps[todo_id])}. "
                     "Remove its dependencies first."
                 )
@@ -184,6 +214,7 @@ class Store:
             except Exception:
                 self.db.execute("ROLLBACK")
                 raise
+            self.on_event("deleted")
             return
 
     # ---- helpers ----
@@ -235,8 +266,10 @@ class DoneBody(BaseModel):
 
 
 def create_app(db_path: Path | str = DEFAULT_DB) -> FastAPI:
-    store = Store(db_path)
     sim = Simulator()
+    holder: dict[str, Metrics] = {}  # Store needs the event hook before Metrics can see the Store
+    store = Store(db_path, on_event=lambda event: holder["m"].events.labels(event).inc())
+    metrics = holder["m"] = Metrics(store, sim, RULES, EVENTS)
 
     @asynccontextmanager
     async def lifespan(_):
@@ -251,10 +284,34 @@ def create_app(db_path: Path | str = DEFAULT_DB) -> FastAPI:
     async def _nf(_, e): return _error(404, e)
 
     @app.exception_handler(Invalid)
-    async def _inv(_, e): return _error(400, e)
+    async def _inv(_, e):
+        metrics.rule_rejections.labels(e.rule).inc()
+        return _error(400, e)
 
     @app.exception_handler(Conflict)
-    async def _conf(_, e): return _error(409, e)
+    async def _conf(_, e):
+        metrics.rule_rejections.labels(e.rule).inc()
+        return _error(409, e)
+
+    @app.middleware("http")
+    async def observe_http(request: Request, call_next):
+        if request.url.path == "/metrics":
+            return await call_next(request)  # don't let scrapes show up in the app's own traffic
+        start, status = time.perf_counter(), 500
+        metrics.in_flight.inc()
+        try:
+            response = await call_next(request)
+            status = response.status_code
+            return response
+        finally:
+            metrics.in_flight.dec()
+            route = metrics.route_label(request.url.path, request.scope.get("route"), status)
+            metrics.http_requests.labels(request.method, route, str(status)).inc()
+            metrics.http_duration.labels(request.method, route).observe(time.perf_counter() - start)
+
+    @app.get("/metrics", include_in_schema=False)
+    def prometheus_metrics() -> Response:
+        return Response(metrics.render(), media_type=CONTENT_TYPE_LATEST)
 
     @app.get("/api/todos")
     def list_todos() -> list[TodoView]:
