@@ -106,10 +106,20 @@ def test_cannot_delete_todo_that_others_depend_on(c):
     assert c.delete(f"/api/todos/{a}").status_code == 204
 
 
-def test_can_delete_the_dependent(c):
+def test_cannot_delete_todo_that_has_dependencies(c):
     a = add(c, "a"); b = add(c, "b", [a])
+    r = c.delete(f"/api/todos/{b}")
+    assert r.status_code == 409 and "dependencies" in r.json()["detail"]
+    assert set(state(c)) == {a, b}
+    deps(c, b, [])  # once its dependencies are removed it can be deleted
     assert c.delete(f"/api/todos/{b}").status_code == 204
-    assert list(state(c)) == [a]
+
+
+def test_cannot_delete_even_when_everything_is_complete(c):
+    a = add(c, "a"); b = add(c, "b", [a])
+    done(c, a); done(c, b)
+    assert c.delete(f"/api/todos/{b}").status_code == 409
+    assert c.delete(f"/api/todos/{a}").status_code == 409
 
 
 def test_removing_a_dependency_unblocks(c):

@@ -9,7 +9,7 @@ server returns and shows the server's error messages. The rules:
      leave a completed todo with an unfinished dependency is refused with a 409:
        - re-opening a todo while a completed todo depends on it
        - adding an unfinished dependency to a completed todo
-       - deleting a todo that other todos depend on
+       - deleting a todo that has dependencies, or that other todos depend on
 """
 import os
 import sqlite3
@@ -165,6 +165,11 @@ class Store:
             todos, deps = self._snapshot()
             if todo_id not in todos:
                 raise NotFound(f"Todo {todo_id} not found")
+            if deps[todo_id]:
+                raise Conflict(
+                    f"Can't delete: it has dependencies: {self._names(todos, deps[todo_id])}. "
+                    "Remove its dependencies first."
+                )
             reliant = [t for t, ds in deps.items() if todo_id in ds]
             if reliant:
                 raise Conflict(
