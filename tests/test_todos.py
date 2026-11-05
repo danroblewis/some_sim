@@ -1,125 +1,174 @@
-import importlib
-import json
-
 import pytest
 from fastapi.testclient import TestClient
 
+from main import create_app
+
 
 @pytest.fixture
-def env(tmp_path, monkeypatch):
-    monkeypatch.setenv("TODOS_FILE", str(tmp_path / "todos.json"))
-    import main
-    importlib.reload(main)
-    return main, TestClient(main.app), tmp_path / "todos.json"
+def db(tmp_path):
+    return tmp_path / "todos.db"
 
 
-def add(c, text):
-    return c.post("/api/todos", json={"text": text}).json()["id"]
+@pytest.fixture
+def c(db):
+    return TestClient(create_app(db))
 
 
-def deps(c, i, d):
-    return c.put(f"/api/todos/{i}/dependencies", json=d)
+def add(c, text, depends_on=()):
+    r = c.post("/api/todos", json={"text": text, "depends_on": list(depends_on)})
+    assert r.status_code == 201, r.text
+    return r.json()["id"]
 
 
-def toggle(c, i):
-    return c.post(f"/api/todos/{i}/toggle")
+def done(c, i, value=True):
+    return c.put(f"/api/todos/{i}/done", json={"done": value})
+
+
+def deps(c, i, ds):
+    return c.put(f"/api/todos/{i}/dependencies", json=list(ds))
 
 
 def state(c):
     return {t["id"]: t for t in c.get("/api/todos").json()}
 
 
-def test_cannot_complete_with_unfinished_dependency(env):
-    _, c, _ = env
+# --- the core rule ---
+
+def test_cannot_complete_until_dependencies_done(c):
     a, b = add(c, "a"), add(c, "b")
     deps(c, b, [a])
-    assert toggle(c, b).status_code == 409
-    assert not state(c)[b]["done"]
-    assert toggle(c, a).status_code == 200
-    assert toggle(c, b).status_code == 200
+    r = done(c, b)
+    assert r.status_code == 409 and "a" in r.json()["detail"]
+    assert state(c)[b]["done"] is False
+    assert done(c, a).status_code == 200
+    assert done(c, b).status_code == 200
 
 
-def test_adding_unfinished_dep_to_done_todo_reopens_it(env):
-    _, c, _ = env
+def test_dependencies_given_at_creation_are_enforced(c):
+    a = add(c, "a")
+    b = add(c, "b", [a])
+    assert done(c, b).status_code == 409
+
+
+def test_all_dependencies_must_be_done(c):
     a, b = add(c, "a"), add(c, "b")
-    toggle(c, b)
-    deps(c, b, [a])
-    assert not state(c)[b]["done"]
+    p = add(c, "parent", [a, b])
+    done(c, a)
+    assert done(c, p).status_code == 409
+    done(c, b)
+    assert done(c, p).status_code == 200
 
 
-def test_uncompleting_dependency_reopens_dependents_transitively(env):
-    _, c, _ = env
-    a, b, d = add(c, "a"), add(c, "b"), add(c, "d")
-    deps(c, b, [a]); deps(c, d, [b])
-    for i in (a, b, d):
-        assert toggle(c, i).status_code == 200
-    toggle(c, a)
-    assert not any(t["done"] for t in state(c).values())
+def test_transitive_chain(c):
+    a = add(c, "a"); b = add(c, "b", [a]); d = add(c, "d", [b])
+    assert done(c, d).status_code == 409
+    assert done(c, b).status_code == 409
+    done(c, a); done(c, b)
+    assert done(c, d).status_code == 200
 
 
-def test_cycles_rejected(env):
-    _, c, _ = env
+def test_computed_fields(c):
+    a = add(c, "a"); b = add(c, "b", [a])
+    s = state(c)
+    assert s[a]["can_complete"] is True and s[a]["blocked_by"] == []
+    assert s[b]["can_complete"] is False and s[b]["blocked_by"] == [a]
+    done(c, a)
+    assert state(c)[b]["can_complete"] is True
+
+
+# --- nothing may leave a completed todo with an unfinished dependency ---
+
+def test_cannot_reopen_while_completed_todo_depends_on_it(c):
+    a = add(c, "a"); b = add(c, "b", [a])
+    done(c, a); done(c, b)
+    assert done(c, a, False).status_code == 409
+    assert state(c)[a]["done"] is True
+    done(c, b, False)
+    assert done(c, a, False).status_code == 200
+
+
+def test_cannot_add_unfinished_dependency_to_completed_todo(c):
     a, b = add(c, "a"), add(c, "b")
-    deps(c, b, [a])
+    done(c, b)
+    assert deps(c, b, [a]).status_code == 409
+    assert state(c)[b]["depends_on"] == []
+    done(c, a)
+    assert deps(c, b, [a]).status_code == 200  # fine if the dependency is already complete
+
+
+def test_cannot_delete_todo_that_others_depend_on(c):
+    a = add(c, "a")
+    b = add(c, "b", [a])
+    assert c.delete(f"/api/todos/{a}").status_code == 409
+    assert a in state(c)
+    assert done(c, b).status_code == 409  # constraint intact
+    deps(c, b, [])
+    assert c.delete(f"/api/todos/{a}").status_code == 204
+
+
+def test_can_delete_the_dependent(c):
+    a = add(c, "a"); b = add(c, "b", [a])
+    assert c.delete(f"/api/todos/{b}").status_code == 204
+    assert list(state(c)) == [a]
+
+
+def test_removing_a_dependency_unblocks(c):
+    a = add(c, "a"); b = add(c, "b", [a])
+    deps(c, b, [])
+    assert done(c, b).status_code == 200
+
+
+# --- validation ---
+
+def test_cycles_rejected(c):
+    a = add(c, "a"); b = add(c, "b", [a]); d = add(c, "d", [b])
+    assert deps(c, a, [d]).status_code == 400
     assert deps(c, a, [b]).status_code == 400
     assert deps(c, a, [a]).status_code == 400
 
 
-def test_unknown_ids(env):
-    _, c, _ = env
+def test_unknown_ids(c):
     a = add(c, "a")
     assert deps(c, a, [99]).status_code == 404
-    assert toggle(c, 99).status_code == 404
+    assert done(c, 99).status_code == 404
+    assert c.delete("/api/todos/99").status_code == 404
+    assert c.post("/api/todos", json={"text": "x", "depends_on": [99]}).status_code == 404
+    assert len(state(c)) == 1  # the failed create left nothing behind
 
 
-def test_persistence_across_restart(env):
-    main, c, path = env
-    a, b = add(c, "a"), add(c, "b")
-    deps(c, b, [a]); toggle(c, a)
-    importlib.reload(main)  # simulates a server restart
-    c2 = TestClient(main.app)
+def test_blank_text_rejected(c):
+    assert c.post("/api/todos", json={"text": "   "}).status_code == 422
+
+
+def test_duplicate_dependency_ids_collapsed(c):
+    a = add(c, "a"); b = add(c, "b", [a, a])
+    assert state(c)[b]["depends_on"] == [a]
+
+
+# --- persistence ---
+
+def test_survives_restart(db):
+    c1 = TestClient(create_app(db))
+    a = add(c1, "a"); b = add(c1, "b", [a]); done(c1, a)
+    c2 = TestClient(create_app(db))  # new app + new connection = restart
     s = state(c2)
     assert s[a]["done"] and not s[b]["done"] and s[b]["depends_on"] == [a]
-    assert add(c2, "c") == 3  # ids keep increasing
+    assert done(c2, b).status_code == 200
+    assert add(c2, "c") == 3
 
 
-def test_ids_not_reused_after_delete(env):
-    _, c, _ = env
+def test_ids_never_reused(c):
     a = add(c, "a")
     c.delete(f"/api/todos/{a}")
     assert add(c, "b") != a
 
 
-def test_cannot_delete_todo_that_others_depend_on(env):
-    _, c, _ = env
-    a, b = add(c, "a"), add(c, "b")
-    deps(c, b, [a])
-    assert c.delete(f"/api/todos/{a}").status_code == 409
-    assert a in state(c) and state(c)[b]["depends_on"] == [a]
-    assert toggle(c, b).status_code == 409  # constraint still holds
-    deps(c, b, [])  # after removing the link, deleting is fine
-    assert c.delete(f"/api/todos/{a}").status_code == 200
-
-
-def test_can_delete_the_dependent(env):
-    _, c, _ = env
-    a, b = add(c, "a"), add(c, "b")
-    deps(c, b, [a])
-    assert c.delete(f"/api/todos/{b}").status_code == 200
-    assert state(c)[a]["done"] is False and b not in state(c)
-
-
-def test_delete_unknown_404(env):
-    _, c, _ = env
-    assert c.delete("/api/todos/42").status_code == 404
-
-
-def test_invalid_data_file_is_repaired_on_load(env):
-    main, _, path = env
-    path.write_text(json.dumps({"next_id": 3, "todos": [
-        {"id": 1, "text": "a", "done": False, "depends_on": []},
-        {"id": 2, "text": "b", "done": True, "depends_on": [1, 77]},
-    ]}))
-    importlib.reload(main)
-    s = state(TestClient(main.app))
-    assert s[2]["done"] is False and s[2]["depends_on"] == [1]
+def test_database_itself_refuses_bad_links(db):
+    """Defense in depth: FK + CHECK constraints back up the Python rules."""
+    import sqlite3
+    store = create_app(db).state.store
+    a = add(TestClient(create_app(db)), "a")
+    with pytest.raises(sqlite3.IntegrityError):
+        store.db.execute("INSERT INTO dependency VALUES (?, ?)", (a, a))
+    with pytest.raises(sqlite3.IntegrityError):
+        store.db.execute("INSERT INTO dependency VALUES (?, ?)", (a, 999))

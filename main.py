@@ -1,163 +1,267 @@
-import json
+"""Todo app with dependencies.
+
+ALL business rules live in `Store` below. The HTML page is a dumb view: it renders what the
+server returns and shows the server's error messages. The rules:
+
+  1. A todo can only be completed when every todo it depends on is completed.
+  2. Dependencies can't form a cycle (and a todo can't depend on itself).
+  3. The server never silently changes a todo you didn't ask about, so any action that would
+     leave a completed todo with an unfinished dependency is refused with a 409:
+       - re-opening a todo while a completed todo depends on it
+       - adding an unfinished dependency to a completed todo
+       - deleting a todo that other todos depend on
+"""
 import os
-import tempfile
+import sqlite3
 import threading
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
-app = FastAPI(title="some_sim")
+DEFAULT_DB = Path(os.environ.get("TODOS_DB", Path(__file__).parent / "data" / "todos.db"))
 
-DATA_FILE = Path(os.environ.get("TODOS_FILE", Path(__file__).parent / "data" / "todos.json"))
-lock = threading.RLock()  # endpoints run in a thread pool; serialize all state changes
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS todo (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    text TEXT    NOT NULL CHECK (length(text) > 0),
+    done INTEGER NOT NULL DEFAULT 0 CHECK (done IN (0, 1))
+);
+CREATE TABLE IF NOT EXISTS dependency (
+    todo_id       INTEGER NOT NULL REFERENCES todo(id) ON DELETE CASCADE,
+    depends_on_id INTEGER NOT NULL REFERENCES todo(id) ON DELETE RESTRICT,
+    PRIMARY KEY (todo_id, depends_on_id),
+    CHECK (todo_id != depends_on_id)
+);
+"""
 
 
-class Todo(BaseModel):
+class NotFound(Exception): ...
+class Invalid(Exception): ...   # bad request (400)
+class Conflict(Exception): ...  # request is well-formed but violates a rule (409)
+
+
+class Store:
+    """The only place where the dependency rules are implemented."""
+
+    def __init__(self, path: Path | str):
+        if str(path) != ":memory:":
+            Path(path).parent.mkdir(parents=True, exist_ok=True)
+        self.db = sqlite3.connect(str(path), check_same_thread=False, isolation_level=None)
+        self.db.row_factory = sqlite3.Row
+        self.db.execute("PRAGMA foreign_keys = ON")
+        self.db.executescript(SCHEMA)
+        self.lock = threading.RLock()  # one operation at a time
+
+    # ---- reads ----
+
+    def _snapshot(self) -> tuple[dict[int, dict], dict[int, list[int]]]:
+        todos = {r["id"]: dict(r) for r in self.db.execute("SELECT id, text, done FROM todo ORDER BY id")}
+        deps: dict[int, list[int]] = {i: [] for i in todos}
+        for r in self.db.execute("SELECT todo_id, depends_on_id FROM dependency ORDER BY depends_on_id"):
+            deps[r["todo_id"]].append(r["depends_on_id"])
+        return todos, deps
+
+    def _view(self, t: dict, deps: dict[int, list[int]], todos: dict[int, dict]) -> dict:
+        blocked_by = [d for d in deps[t["id"]] if not todos[d]["done"]]
+        return {
+            "id": t["id"],
+            "text": t["text"],
+            "done": bool(t["done"]),
+            "depends_on": deps[t["id"]],
+            "blocked_by": blocked_by,          # unfinished dependencies
+            "can_complete": not t["done"] and not blocked_by,
+        }
+
+    def list_all(self) -> list[dict]:
+        with self.lock:
+            todos, deps = self._snapshot()
+            return [self._view(t, deps, todos) for t in todos.values()]
+
+    def get(self, todo_id: int) -> dict:
+        with self.lock:
+            todos, deps = self._snapshot()
+            if todo_id not in todos:
+                raise NotFound(f"Todo {todo_id} not found")
+            return self._view(todos[todo_id], deps, todos)
+
+    # ---- writes ----
+
+    def create(self, text: str, depends_on: list[int]) -> dict:
+        with self.lock:
+            todos, deps = self._snapshot()
+            depends_on = list(dict.fromkeys(depends_on))
+            for d in depends_on:
+                if d not in todos:
+                    raise NotFound(f"Dependency {d} not found")
+            self.db.execute("BEGIN")
+            try:
+                new_id = self.db.execute("INSERT INTO todo (text) VALUES (?)", (text,)).lastrowid
+                self.db.executemany(
+                    "INSERT INTO dependency (todo_id, depends_on_id) VALUES (?, ?)",
+                    [(new_id, d) for d in depends_on],
+                )
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+            return self.get(new_id)
+
+    def set_done(self, todo_id: int, done: bool) -> dict:
+        with self.lock:
+            todos, deps = self._snapshot()
+            if todo_id not in todos:
+                raise NotFound(f"Todo {todo_id} not found")
+            if done:
+                pending = [d for d in deps[todo_id] if not todos[d]["done"]]
+                if pending:
+                    raise Conflict(f"Can't complete: dependencies not done yet: {self._names(todos, pending)}")
+            else:
+                reliant = [t for t, ds in deps.items() if todo_id in ds and todos[t]["done"]]
+                if reliant:
+                    raise Conflict(
+                        f"Can't re-open: completed todos depend on it: {self._names(todos, reliant)}. "
+                        "Re-open those first."
+                    )
+            self.db.execute("UPDATE todo SET done = ? WHERE id = ?", (int(done), todo_id))
+            return self.get(todo_id)
+
+    def set_dependencies(self, todo_id: int, new_deps: list[int]) -> dict:
+        with self.lock:
+            todos, deps = self._snapshot()
+            if todo_id not in todos:
+                raise NotFound(f"Todo {todo_id} not found")
+            new_deps = list(dict.fromkeys(new_deps))
+            for d in new_deps:
+                if d not in todos:
+                    raise NotFound(f"Dependency {d} not found")
+                if d == todo_id:
+                    raise Invalid("A todo can't depend on itself")
+                if self._reaches(deps, d, todo_id):
+                    raise Invalid(f"Dependency on '{todos[d]['text']}' would create a cycle")
+            if todos[todo_id]["done"]:
+                pending = [d for d in new_deps if not todos[d]["done"]]
+                if pending:
+                    raise Conflict(
+                        f"Can't add unfinished dependencies to a completed todo: {self._names(todos, pending)}. "
+                        "Re-open it first."
+                    )
+            self.db.execute("BEGIN")
+            try:
+                self.db.execute("DELETE FROM dependency WHERE todo_id = ?", (todo_id,))
+                self.db.executemany(
+                    "INSERT INTO dependency (todo_id, depends_on_id) VALUES (?, ?)",
+                    [(todo_id, d) for d in new_deps],
+                )
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+            return self.get(todo_id)
+
+    def delete(self, todo_id: int) -> None:
+        with self.lock:
+            todos, deps = self._snapshot()
+            if todo_id not in todos:
+                raise NotFound(f"Todo {todo_id} not found")
+            reliant = [t for t, ds in deps.items() if todo_id in ds]
+            if reliant:
+                raise Conflict(
+                    f"Can't delete: other todos depend on it: {self._names(todos, reliant)}. "
+                    "Remove those dependencies first."
+                )
+            self.db.execute("DELETE FROM todo WHERE id = ?", (todo_id,))
+
+    # ---- helpers ----
+
+    @staticmethod
+    def _names(todos: dict[int, dict], ids: list[int]) -> str:
+        return ", ".join(f"'{todos[i]['text']}' (#{i})" for i in ids)
+
+    @staticmethod
+    def _reaches(deps: dict[int, list[int]], start: int, target: int) -> bool:
+        """Is `target` reachable from `start` by following dependencies?"""
+        stack, seen = [start], set()
+        while stack:
+            cur = stack.pop()
+            if cur == target:
+                return True
+            if cur not in seen:
+                seen.add(cur)
+                stack.extend(deps[cur])
+        return False
+
+
+# ---------- HTTP layer: no rules here, just translation ----------
+
+class TodoView(BaseModel):
     id: int
     text: str
-    done: bool = False
+    done: bool
+    depends_on: list[int]
+    blocked_by: list[int]
+    can_complete: bool
+
+
+class NewTodo(BaseModel):
+    text: str = Field(max_length=500)
     depends_on: list[int] = Field(default_factory=list)
 
-
-class TodoIn(BaseModel):
-    text: str = Field(min_length=1, max_length=500)
-
-
-todos: dict[int, Todo] = {}
-next_id = 1
-
-
-# ---------- invariants (enforced by the server, never by the client) ----------
-
-def enforce_invariants() -> None:
-    """Drop dangling deps and un-complete any todo that is done while a dependency isn't.
-
-    Runs after every change and on load, so no sequence of requests (or a hand-edited
-    data file) can leave a completed todo with an unfinished dependency.
-    """
-    for t in todos.values():
-        t.depends_on = [d for d in dict.fromkeys(t.depends_on) if d in todos and d != t.id]
-    changed = True
-    while changed:
-        changed = False
-        for t in todos.values():
-            if t.done and any(not todos[d].done for d in t.depends_on):
-                t.done = False
-                changed = True
+    @field_validator("text")
+    @classmethod
+    def not_blank(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("text must not be blank")
+        return v
 
 
-def reaches(start: int, target: int) -> bool:
-    """True if `target` is reachable from `start` by following dependencies."""
-    stack, seen = [start], set()
-    while stack:
-        cur = stack.pop()
-        if cur == target:
-            return True
-        if cur not in seen:
-            seen.add(cur)
-            stack.extend(todos[cur].depends_on)
-    return False
+class DoneBody(BaseModel):
+    done: bool
 
 
-# ---------- persistence ----------
+def create_app(db_path: Path | str = DEFAULT_DB) -> FastAPI:
+    store = Store(db_path)
+    app = FastAPI(title="Todos with dependencies")
+    app.state.store = store
 
-def save() -> None:
-    enforce_invariants()
-    DATA_FILE.parent.mkdir(parents=True, exist_ok=True)
-    payload = {"next_id": next_id, "todos": [t.model_dump() for t in todos.values()]}
-    fd, tmp = tempfile.mkstemp(dir=DATA_FILE.parent, suffix=".tmp")
-    with os.fdopen(fd, "w") as f:
-        json.dump(payload, f, indent=2)
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, DATA_FILE)  # atomic: a crash never leaves a half-written file
+    @app.exception_handler(NotFound)
+    async def _nf(_, e): return _error(404, e)
 
+    @app.exception_handler(Invalid)
+    async def _inv(_, e): return _error(400, e)
 
-def load() -> None:
-    global next_id
-    todos.clear()
-    next_id = 1
-    if DATA_FILE.exists():
-        data = json.loads(DATA_FILE.read_text())
-        for raw in data["todos"]:
-            todos[raw["id"]] = Todo(**raw)
-        next_id = max(data.get("next_id", 1), max(todos, default=0) + 1)
-    enforce_invariants()
+    @app.exception_handler(Conflict)
+    async def _conf(_, e): return _error(409, e)
 
+    @app.get("/api/todos")
+    def list_todos() -> list[TodoView]:
+        return store.list_all()
 
-load()
+    @app.post("/api/todos", status_code=201)
+    def create_todo(body: NewTodo) -> TodoView:
+        return store.create(body.text, body.depends_on)
 
+    @app.put("/api/todos/{todo_id}/done")
+    def set_done(todo_id: int, body: DoneBody) -> TodoView:
+        return store.set_done(todo_id, body.done)
 
-# ---------- API ----------
+    @app.put("/api/todos/{todo_id}/dependencies")
+    def set_dependencies(todo_id: int, depends_on: list[int]) -> TodoView:
+        return store.set_dependencies(todo_id, depends_on)
 
-def get_todo(todo_id: int) -> Todo:
-    if todo_id not in todos:
-        raise HTTPException(404, f"Todo {todo_id} not found")
-    return todos[todo_id]
+    @app.delete("/api/todos/{todo_id}", status_code=204)
+    def delete_todo(todo_id: int) -> None:
+        store.delete(todo_id)
 
-
-@app.get("/api/todos")
-def list_todos() -> list[Todo]:
-    with lock:
-        return list(todos.values())
+    app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
+    return app
 
 
-@app.post("/api/todos")
-def add_todo(body: TodoIn) -> Todo:
-    global next_id
-    with lock:
-        todo = Todo(id=next_id, text=body.text.strip())
-        todos[next_id] = todo
-        next_id += 1
-        save()
-        return todo
+def _error(status: int, e: Exception):
+    from fastapi.responses import JSONResponse
+    return JSONResponse(status_code=status, content={"detail": str(e)})
 
 
-@app.post("/api/todos/{todo_id}/toggle")
-def toggle_todo(todo_id: int) -> Todo:
-    with lock:
-        todo = get_todo(todo_id)
-        if not todo.done:
-            pending = [d for d in todo.depends_on if not todos[d].done]
-            if pending:
-                raise HTTPException(409, f"Complete dependencies first: {pending}")
-            todo.done = True
-        else:
-            todo.done = False  # dependents are un-completed by enforce_invariants()
-        save()
-        return todo
-
-
-@app.put("/api/todos/{todo_id}/dependencies")
-def set_dependencies(todo_id: int, deps: list[int]) -> Todo:
-    with lock:
-        todo = get_todo(todo_id)
-        deps = list(dict.fromkeys(deps))
-        for d in deps:
-            get_todo(d)
-            if reaches(d, todo_id):  # also catches d == todo_id
-                raise HTTPException(400, f"Dependency {d} would create a cycle")
-        todo.depends_on = deps
-        save()  # un-completes this todo (and its dependents) if it now has an unfinished dep
-        return todo
-
-
-@app.delete("/api/todos/{todo_id}")
-def delete_todo(todo_id: int) -> dict:
-    with lock:
-        get_todo(todo_id)
-        dependents = [t.id for t in todos.values() if todo_id in t.depends_on]
-        if dependents:
-            # Deleting it would silently drop the constraint on these todos.
-            raise HTTPException(
-                409, f"Can't delete: todos {dependents} depend on it. Remove those dependencies first."
-            )
-        del todos[todo_id]
-        save()
-        return {"ok": True}
-
-
-# Plain HTML pages (React loaded from a CDN, no build step)
-app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
+app = create_app()

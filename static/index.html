@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>some_sim</title>
+  <title>Todos</title>
   <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
   <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
   <script src="https://unpkg.com/@babel/standalone@7.26.0/babel.min.js"></script>
@@ -11,83 +11,86 @@
     body { font-family: system-ui, sans-serif; background: #f5f6f8; color: #222; margin: 0; }
     main { max-width: 640px; margin: 2rem auto; padding: 0 1rem; }
     .card { background: #fff; border: 1px solid #dde; border-radius: 8px; padding: 12px 14px; margin-bottom: 10px; }
-    .card.blocked { background: #fafafa; border-style: dashed; }
     .row { display: flex; align-items: center; gap: 8px; }
-    .row .grow { flex: 1; }
+    .grow { flex: 1; }
     .done .title { text-decoration: line-through; color: #888; }
     .badge { font-size: 12px; padding: 2px 8px; border-radius: 10px; }
-    .badge.blocked { background: #ffe9d6; color: #a04a00; }
+    .badge.waiting { background: #ffe9d6; color: #a04a00; }
     .badge.ready { background: #dcf5e1; color: #1c6b30; }
-    .badge.done { background: #e6e6e6; color: #555; }
+    .badge.complete { background: #e6e6e6; color: #555; }
     .deps { margin: 8px 0 0 26px; font-size: 13px; }
-    .chip { display: inline-flex; align-items: center; gap: 4px; background: #eef; border-radius: 12px; padding: 2px 4px 2px 10px; margin: 2px 4px 2px 0; }
+    .chip { display: inline-block; background: #eef; border-radius: 12px; padding: 2px 10px; margin: 2px 4px 2px 0; }
     .chip.done { background: #e3f4e6; text-decoration: line-through; color: #567; }
-    .chip button { border: 0; background: none; cursor: pointer; color: #667; }
     .picker { margin: 8px 0; padding: 8px 10px; background: #fff; border: 1px solid #dde; border-radius: 8px; font-size: 14px; }
     .picker label { display: block; padding: 2px 0; }
+    .error { background: #fde8e8; border: 1px solid #f3b5b5; color: #8a1c1c; border-radius: 8px; padding: 8px 12px; margin: 10px 0; display: flex; justify-content: space-between; }
     input[type=text] { padding: 8px; font-size: 15px; }
-    button.primary { padding: 8px 14px; font-size: 15px; }
     .muted { color: #777; font-size: 13px; }
   </style>
 </head>
 <body>
   <div id="root"></div>
   <script type="text/babel">
+    // This page contains NO business rules. It shows what the server returns and
+    // reports the server's error messages. The server decides what is allowed.
     const { useState, useEffect } = React;
-    const api = (path, opts) =>
-      fetch(`/api${path}`, opts).then(async (r) => {
-        const data = await r.json();
-        if (!r.ok) { alert(data.detail || "Request failed"); return null; }
-        return data;
-      });
-    const json = (method, body) => ({
-      method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
-    });
 
-    function DepPicker({ options, selected, onChange }) {
-      if (options.length === 0) return <p className="muted">No other todos to depend on yet.</p>;
+    async function call(path, method = "GET", body) {
+      const res = await fetch(`/api${path}`, {
+        method,
+        headers: { "Content-Type": "application/json" },
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      if (res.status === 204) return null;
+      const data = await res.json();
+      if (!res.ok) {
+        const d = data.detail;
+        throw new Error(typeof d === "string" ? d : JSON.stringify(d));
+      }
+      return data;
+    }
+
+    function Picker({ todos, selected, onChange }) {
+      if (todos.length === 0) return <p className="muted">There are no other todos yet.</p>;
       return (
         <div className="picker">
-          {options.map((o) => (
-            <label key={o.id}>
-              <input type="checkbox" checked={selected.includes(o.id)}
-                onChange={(e) => onChange(e.target.checked ? [...selected, o.id] : selected.filter((x) => x !== o.id))} />{" "}
-              #{o.id} {o.text} {o.done && <span className="muted">(done)</span>}
+          {todos.map((t) => (
+            <label key={t.id}>
+              <input type="checkbox" checked={selected.includes(t.id)}
+                onChange={(e) => onChange(e.target.checked ? [...selected, t.id] : selected.filter((x) => x !== t.id))} />{" "}
+              {t.text} {t.done && <span className="muted">(complete)</span>}
             </label>
           ))}
         </div>
       );
     }
 
-    function TodoCard({ t, todos, byId, onToggle, onRemove, onSetDeps }) {
+    function TodoCard({ todo, others, byId, act }) {
       const [editing, setEditing] = useState(false);
-      const pending = t.depends_on.filter((d) => byId[d] && !byId[d].done);
-      const blocked = pending.length > 0;
-      const status = t.done ? "done" : blocked ? "blocked" : "ready";
-      const options = todos.filter((o) => o.id !== t.id);
+      const status = todo.done ? "complete" : todo.blocked_by.length ? "waiting" : "ready";
       return (
-        <div className={`card ${t.done ? "done" : ""} ${blocked && !t.done ? "blocked" : ""}`}>
+        <div className={`card ${todo.done ? "done" : ""}`}>
           <div className="row">
-            <input type="checkbox" checked={t.done} disabled={blocked && !t.done}
-              title={blocked ? "Complete its dependencies first" : ""} onChange={() => onToggle(t.id)} />
-            <span className="title grow">#{t.id} {t.text}</span>
+            <input type="checkbox" checked={todo.done}
+              onChange={() => act(() => call(`/todos/${todo.id}/done`, "PUT", { done: !todo.done }))} />
+            <span className="title grow">{todo.text}</span>
             <span className={`badge ${status}`}>
-              {status === "blocked" ? `blocked by ${pending.length}` : status}
+              {status === "waiting" ? `waiting on ${todo.blocked_by.length}` : status}
             </span>
             <button onClick={() => setEditing(!editing)}>{editing ? "Close" : "Dependencies"}</button>
-            <button onClick={() => onRemove(t.id)} title="Delete">✕</button>
+            <button title="Delete" onClick={() => act(() => call(`/todos/${todo.id}`, "DELETE"))}>✕</button>
           </div>
-          {(t.depends_on.length > 0 || editing) && (
+          {(todo.depends_on.length > 0 || editing) && (
             <div className="deps">
               <span className="muted">Depends on: </span>
-              {t.depends_on.length === 0 && <span className="muted">nothing</span>}
-              {t.depends_on.map((d) => (
-                <span key={d} className={`chip ${byId[d]?.done ? "done" : ""}`}>
-                  #{d} {byId[d]?.text}
-                  <button title="Remove dependency" onClick={() => onSetDeps(t.id, t.depends_on.filter((x) => x !== d))}>×</button>
-                </span>
+              {todo.depends_on.length === 0 && <span className="muted">nothing</span>}
+              {todo.depends_on.map((d) => (
+                <span key={d} className={`chip ${byId[d].done ? "done" : ""}`}>{byId[d].text}</span>
               ))}
-              {editing && <DepPicker options={options} selected={t.depends_on} onChange={(deps) => onSetDeps(t.id, deps)} />}
+              {editing && (
+                <Picker todos={others} selected={todo.depends_on}
+                  onChange={(deps) => act(() => call(`/todos/${todo.id}/dependencies`, "PUT", deps))} />
+              )}
             </div>
           )}
         </div>
@@ -96,41 +99,50 @@
 
     function App() {
       const [todos, setTodos] = useState([]);
+      const [error, setError] = useState(null);
       const [text, setText] = useState("");
-      const [newDeps, setNewDeps] = useState([]);
-      const [pickDeps, setPickDeps] = useState(false);
-      const load = () => api("/todos").then((d) => d && setTodos(d));
-      useEffect(() => { load(); }, []);
-      const byId = Object.fromEntries(todos.map((t) => [t.id, t]));
+      const [deps, setDeps] = useState([]);
+      const [picking, setPicking] = useState(false);
 
-      const add = async (e) => {
-        e.preventDefault();
-        if (!text.trim()) return;
-        const created = await api("/todos", json("POST", { text }));
-        if (created && newDeps.length) await api(`/todos/${created.id}/dependencies`, json("PUT", newDeps));
-        setText(""); setNewDeps([]); setPickDeps(false);
-        load();
+      const refresh = () => call("/todos").then(setTodos);
+      useEffect(() => { refresh().catch((e) => setError(e.message)); }, []);
+
+      // Run an action, show any server error, then reload the server's state.
+      const act = async (fn) => {
+        try { await fn(); setError(null); }
+        catch (e) { setError(e.message); }
+        await refresh();
       };
-      const toggle = (id) => api(`/todos/${id}/toggle`, { method: "POST" }).then(load);
-      const remove = (id) => api(`/todos/${id}`, { method: "DELETE" }).then(load);
-      const setDeps = (id, deps) => api(`/todos/${id}/dependencies`, json("PUT", deps)).then(load);
 
+      const add = (e) => {
+        e.preventDefault();
+        act(async () => {
+          await call("/todos", "POST", { text, depends_on: deps });
+          setText(""); setDeps([]); setPicking(false);
+        });
+      };
+
+      const byId = Object.fromEntries(todos.map((t) => [t.id, t]));
       return (
         <main>
-          <h1>some_sim todos</h1>
+          <h1>Todos</h1>
           <form onSubmit={add}>
             <div className="row">
-              <input type="text" className="grow" value={text} onChange={(e) => setText(e.target.value)} placeholder="What needs doing?" />
-              <button type="button" onClick={() => setPickDeps(!pickDeps)}>
-                Dependencies{newDeps.length ? ` (${newDeps.length})` : ""}
+              <input type="text" className="grow" value={text} onChange={(e) => setText(e.target.value)}
+                placeholder="What needs doing?" />
+              <button type="button" onClick={() => setPicking(!picking)}>
+                Depends on{deps.length ? ` (${deps.length})` : ""}…
               </button>
-              <button className="primary">Add</button>
+              <button>Add</button>
             </div>
-            {pickDeps && <DepPicker options={todos} selected={newDeps} onChange={setNewDeps} />}
+            {picking && <Picker todos={todos} selected={deps} onChange={setDeps} />}
           </form>
-          <p className="muted">A todo can only be completed once everything it depends on is done.</p>
+          {error && (
+            <div className="error"><span>{error}</span><button onClick={() => setError(null)}>×</button></div>
+          )}
+          <p className="muted">A todo can't be completed until everything it depends on is complete.</p>
           {todos.map((t) => (
-            <TodoCard key={t.id} t={t} todos={todos} byId={byId} onToggle={toggle} onRemove={remove} onSetDeps={setDeps} />
+            <TodoCard key={t.id} todo={t} others={todos.filter((o) => o.id !== t.id)} byId={byId} act={act} />
           ))}
         </main>
       );
