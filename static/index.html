@@ -1,0 +1,61 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>some_sim</title>
+  <script crossorigin src="https://unpkg.com/react@18.3.1/umd/react.production.min.js"></script>
+  <script crossorigin src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone@7.26.0/babel.min.js"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useEffect } = React;
+    const api = (path, opts) => fetch(`/api${path}`, opts).then((r) => r.json());
+
+    function App() {
+      const [todos, setTodos] = useState([]);
+      const [text, setText] = useState("");
+      const load = () => api("/todos").then(setTodos);
+      useEffect(() => { load(); }, []);
+
+      const add = async (e) => {
+        e.preventDefault();
+        if (!text.trim()) return;
+        await api("/todos", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ text }),
+        });
+        setText("");
+        load();
+      };
+      const toggle = (id) => api(`/todos/${id}/toggle`, { method: "POST" }).then(load);
+      const remove = (id) => api(`/todos/${id}`, { method: "DELETE" }).then(load);
+
+      return (
+        <main style={{ maxWidth: 480, margin: "3rem auto", fontFamily: "system-ui" }}>
+          <h1>some_sim todos</h1>
+          <form onSubmit={add}>
+            <input value={text} onChange={(e) => setText(e.target.value)} placeholder="What needs doing?" />
+            <button>Add</button>
+          </form>
+          <ul>
+            {todos.map((t) => (
+              <li key={t.id}>
+                <label style={{ textDecoration: t.done ? "line-through" : "none" }}>
+                  <input type="checkbox" checked={t.done} onChange={() => toggle(t.id)} /> {t.text}
+                </label>{" "}
+                <button onClick={() => remove(t.id)}>✕</button>
+              </li>
+            ))}
+          </ul>
+        </main>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById("root")).render(<App />);
+  </script>
+</body>
+</html>

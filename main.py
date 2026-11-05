@@ -47,7 +47,5 @@ def delete_todo(todo_id: int) -> dict:
     return {"ok": True}
 
 
-# Serve the built React app (run `npm run build` in frontend/ first)
-dist = Path(__file__).parent.parent / "frontend" / "dist"
-if dist.exists():
-    app.mount("/", StaticFiles(directory=dist, html=True), name="static")
+# Plain HTML pages (React loaded from a CDN, no build step)
+app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
