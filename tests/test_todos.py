@@ -90,12 +90,28 @@ def test_ids_not_reused_after_delete(env):
     assert add(c, "b") != a
 
 
-def test_delete_removes_dependency_links(env):
+def test_cannot_delete_todo_that_others_depend_on(env):
     _, c, _ = env
     a, b = add(c, "a"), add(c, "b")
     deps(c, b, [a])
-    c.delete(f"/api/todos/{a}")
-    assert state(c)[b]["depends_on"] == []
+    assert c.delete(f"/api/todos/{a}").status_code == 409
+    assert a in state(c) and state(c)[b]["depends_on"] == [a]
+    assert toggle(c, b).status_code == 409  # constraint still holds
+    deps(c, b, [])  # after removing the link, deleting is fine
+    assert c.delete(f"/api/todos/{a}").status_code == 200
+
+
+def test_can_delete_the_dependent(env):
+    _, c, _ = env
+    a, b = add(c, "a"), add(c, "b")
+    deps(c, b, [a])
+    assert c.delete(f"/api/todos/{b}").status_code == 200
+    assert state(c)[a]["done"] is False and b not in state(c)
+
+
+def test_delete_unknown_404(env):
+    _, c, _ = env
+    assert c.delete("/api/todos/42").status_code == 404
 
 
 def test_invalid_data_file_is_repaired_on_load(env):

@@ -147,7 +147,14 @@ def set_dependencies(todo_id: int, deps: list[int]) -> Todo:
 @app.delete("/api/todos/{todo_id}")
 def delete_todo(todo_id: int) -> dict:
     with lock:
-        todos.pop(todo_id, None)
+        get_todo(todo_id)
+        dependents = [t.id for t in todos.values() if todo_id in t.depends_on]
+        if dependents:
+            # Deleting it would silently drop the constraint on these todos.
+            raise HTTPException(
+                409, f"Can't delete: todos {dependents} depend on it. Remove those dependencies first."
+            )
+        del todos[todo_id]
         save()
         return {"ok": True}
 
