@@ -12,12 +12,21 @@
   <div id="root"></div>
   <script type="text/babel">
     const { useState, useEffect } = React;
-    const api = (path, opts) => fetch(`/api${path}`, opts).then((r) => r.json());
+    const api = (path, opts) =>
+      fetch(`/api${path}`, opts).then(async (r) => {
+        const data = await r.json();
+        if (!r.ok) { alert(data.detail || "Request failed"); return null; }
+        return data;
+      });
+    const json = (method, body) => ({
+      method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body),
+    });
 
     function App() {
       const [todos, setTodos] = useState([]);
       const [text, setText] = useState("");
-      const load = () => api("/todos").then(setTodos);
+      const load = () => api("/todos").then((d) => d && setTodos(d));
+      const byId = Object.fromEntries(todos.map((t) => [t.id, t]));
       useEffect(() => { load(); }, []);
 
       const add = async (e) => {
@@ -32,6 +41,7 @@
         load();
       };
       const toggle = (id) => api(`/todos/${id}/toggle`, { method: "POST" }).then(load);
+      const setDeps = (t, deps) => api(`/todos/${t.id}/dependencies`, json("PUT", deps)).then(load);
       const remove = (id) => api(`/todos/${id}`, { method: "DELETE" }).then(load);
 
       return (
@@ -42,14 +52,35 @@
             <button>Add</button>
           </form>
           <ul>
-            {todos.map((t) => (
-              <li key={t.id}>
-                <label style={{ textDecoration: t.done ? "line-through" : "none" }}>
-                  <input type="checkbox" checked={t.done} onChange={() => toggle(t.id)} /> {t.text}
-                </label>{" "}
-                <button onClick={() => remove(t.id)}>✕</button>
-              </li>
-            ))}
+            {todos.map((t) => {
+              const blocked = t.depends_on.some((d) => byId[d] && !byId[d].done);
+              const options = todos.filter((o) => o.id !== t.id && !t.depends_on.includes(o.id));
+              return (
+                <li key={t.id} style={{ marginBottom: 8 }}>
+                  <label style={{ textDecoration: t.done ? "line-through" : "none", opacity: blocked ? 0.6 : 1 }}>
+                    <input type="checkbox" checked={t.done} disabled={blocked && !t.done}
+                      title={blocked ? "Complete its dependencies first" : ""}
+                      onChange={() => toggle(t.id)} /> #{t.id} {t.text}
+                  </label>{" "}
+                  <button onClick={() => remove(t.id)}>✕</button>
+                  <div style={{ fontSize: 13, marginLeft: 24 }}>
+                    {t.depends_on.length > 0 && <span>depends on: </span>}
+                    {t.depends_on.map((d) => (
+                      <span key={d} style={{ marginRight: 6, textDecoration: byId[d]?.done ? "line-through" : "none" }}>
+                        #{d} {byId[d]?.text}
+                        <button onClick={() => setDeps(t, t.depends_on.filter((x) => x !== d))}>×</button>
+                      </span>
+                    ))}
+                    {options.length > 0 && (
+                      <select value="" onChange={(e) => setDeps(t, [...t.depends_on, Number(e.target.value)])}>
+                        <option value="">+ add dependency…</option>
+                        {options.map((o) => <option key={o.id} value={o.id}>#{o.id} {o.text}</option>)}
+                      </select>
+                    )}
+                  </div>
+                </li>
+              );
+            })}
           </ul>
         </main>
       );
