@@ -14,7 +14,8 @@ uvicorn main:app --port 8000      # http://localhost:8000
 - Dependencies can't form cycles or point at the todo itself (400).
 - The server never silently changes other todos, so these are refused with a 409:
   re-opening a todo that a completed todo depends on, adding an unfinished dependency to a
-  completed todo, and deleting a todo that has dependencies (or that others depend on).
+  completed todo, and deleting a todo that has dependencies. A todo with no dependencies can always be deleted;
+  links other todos had to it are removed with it.
 
 The page contains no rules; it renders server state and shows the server's error messages.
 

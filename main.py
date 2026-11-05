@@ -9,7 +9,8 @@ server returns and shows the server's error messages. The rules:
      leave a completed todo with an unfinished dependency is refused with a 409:
        - re-opening a todo while a completed todo depends on it
        - adding an unfinished dependency to a completed todo
-       - deleting a todo that has dependencies, or that other todos depend on
+       - deleting a todo that has dependencies (a todo with none can always be deleted;
+         links other todos had to it are removed along with it)
 """
 import os
 import sqlite3
@@ -30,7 +31,7 @@ CREATE TABLE IF NOT EXISTS todo (
 );
 CREATE TABLE IF NOT EXISTS dependency (
     todo_id       INTEGER NOT NULL REFERENCES todo(id) ON DELETE CASCADE,
-    depends_on_id INTEGER NOT NULL REFERENCES todo(id) ON DELETE RESTRICT,
+    depends_on_id INTEGER NOT NULL REFERENCES todo(id) ON DELETE CASCADE,
     PRIMARY KEY (todo_id, depends_on_id),
     CHECK (todo_id != depends_on_id)
 );
@@ -170,13 +171,17 @@ class Store:
                     f"Can't delete: it has dependencies: {self._names(todos, deps[todo_id])}. "
                     "Remove its dependencies first."
                 )
-            reliant = [t for t, ds in deps.items() if todo_id in ds]
-            if reliant:
-                raise Conflict(
-                    f"Can't delete: other todos depend on it: {self._names(todos, reliant)}. "
-                    "Remove those dependencies first."
-                )
-            self.db.execute("DELETE FROM todo WHERE id = ?", (todo_id,))
+            # A todo with no dependencies is always deletable. Links that other todos had
+            # *to* it go away with it (it no longer exists, so it can't be an open dependency).
+            self.db.execute("BEGIN")
+            try:
+                self.db.execute("DELETE FROM dependency WHERE depends_on_id = ?", (todo_id,))
+                self.db.execute("DELETE FROM todo WHERE id = ?", (todo_id,))
+                self.db.execute("COMMIT")
+            except Exception:
+                self.db.execute("ROLLBACK")
+                raise
+            return
 
     # ---- helpers ----
 

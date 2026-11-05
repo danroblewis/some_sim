@@ -96,14 +96,21 @@ def test_cannot_add_unfinished_dependency_to_completed_todo(c):
     assert deps(c, b, [a]).status_code == 200  # fine if the dependency is already complete
 
 
-def test_cannot_delete_todo_that_others_depend_on(c):
-    a = add(c, "a")
-    b = add(c, "b", [a])
-    assert c.delete(f"/api/todos/{a}").status_code == 409
-    assert a in state(c)
-    assert done(c, b).status_code == 409  # constraint intact
-    deps(c, b, [])
-    assert c.delete(f"/api/todos/{a}").status_code == 204
+def test_todo_with_no_dependencies_can_be_deleted_even_if_others_depend_on_it(c):
+    orig = add(c, "orig")
+    depped = add(c, "depped", [orig])
+    assert c.delete(f"/api/todos/{orig}").status_code == 204
+    s = state(c)
+    assert list(s) == [depped]
+    assert s[depped]["depends_on"] == []  # the link to the deleted todo is gone
+
+
+def test_delete_leaf_in_a_chain(c):
+    a = add(c, "a"); b = add(c, "b", [a]); d = add(c, "d", [b])
+    assert c.delete(f"/api/todos/{b}").status_code == 409  # b has a dependency
+    assert c.delete(f"/api/todos/{d}").status_code == 409  # d has a dependency
+    assert c.delete(f"/api/todos/{a}").status_code == 204  # a has none
+    assert state(c)[b]["depends_on"] == [] and state(c)[d]["depends_on"] == [b]
 
 
 def test_cannot_delete_todo_that_has_dependencies(c):
@@ -118,8 +125,8 @@ def test_cannot_delete_todo_that_has_dependencies(c):
 def test_cannot_delete_even_when_everything_is_complete(c):
     a = add(c, "a"); b = add(c, "b", [a])
     done(c, a); done(c, b)
-    assert c.delete(f"/api/todos/{b}").status_code == 409
-    assert c.delete(f"/api/todos/{a}").status_code == 409
+    assert c.delete(f"/api/todos/{b}").status_code == 409  # b has a dependency
+    assert c.delete(f"/api/todos/{a}").status_code == 204  # a has none
 
 
 def test_removing_a_dependency_unblocks(c):
