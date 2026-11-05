@@ -16,6 +16,10 @@ from collections import defaultdict
 
 import httpx
 
+# Relative odds of each action per tick (an action is only offered if it can apply: there must be an
+# open todo to complete, a completed todo to delete). Deletes outweigh creates so the list drains.
+WEIGHTS = {"create": 1, "complete": 3, "delete": 3}
+
 VERBS = ["write", "review", "deploy", "test", "fix", "plan", "refactor", "document", "ship", "audit"]
 NOUNS = ["parser", "login page", "database", "report", "cache", "queue", "API", "dashboard", "build", "schema"]
 
@@ -104,7 +108,7 @@ class Simulator:
         open_todos = [t for t in todos if not t["done"]]
         done_todos = [t for t in todos if t["done"]]
         actions = ["create"] + (["complete"] if open_todos else []) + (["delete"] if done_todos else [])
-        action = self.rng.choice(actions)
+        action = self.rng.choices(actions, weights=[WEIGHTS[a] for a in actions])[0]
         if action == "create":
             deps: list[int] = []
             if todos and self.rng.random() < 0.5:

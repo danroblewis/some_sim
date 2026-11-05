@@ -34,7 +34,8 @@ The page contains no rules; it renders server state and shows the server's error
 - **Simulator** (`simulator.py`): a loop inside the server that sends real HTTP requests to this
   app's own API. Each tick it lists the todos, then either creates a todo (50% chance it depends on
   1-3 random existing todos) , tries to complete a random open todo, or tries to delete a random
-  completed todo. It knows nothing about the rules, so completing a blocked todo or deleting one
+  completed todo. Deletes are weighted above creates (`WEIGHTS` in `simulator.py`, create:complete:delete = 1:3:3)
+  so the list stays small and gets cleared out now and then. It knows nothing about the rules, so completing a blocked todo or deleting one
   that still has dependencies is just a request the server rejects with 409 (counted as "rejected"). It's off until started: use the Start/Stop button in the page, or
   `POST /api/simulator/start?interval=1.0` / `POST /api/simulator/stop` / `GET /api/simulator`.
 - **Monitor**: the page reloads the todo list and simulator stats every 2s (`POLL_MS` in

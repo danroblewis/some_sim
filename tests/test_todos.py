@@ -228,45 +228,62 @@ def test_completing_is_idempotent(c):
 # --- traffic simulator ---
 
 def run_sim(db, seed, ticks):
-    """Run the simulator's ticks against the app in-process, over the real ASGI stack."""
+    """Run the simulator's ticks against the app in-process, over the real ASGI stack.
+
+    After every tick the server's state is checked against the rules; returns the simulator,
+    a client, and the list size after each tick.
+    """
     import asyncio, random
     import httpx
     from simulator import Simulator
 
     app = create_app(db)
     sim = Simulator(random.Random(seed))
+    sizes, saw_dependency = [], []
 
     async def go():
         async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
             for _ in range(ticks):
                 await sim.tick(client)
+                s = {t["id"]: t for t in app.state.store.list_all()}
+                for t in s.values():
+                    if t["done"]:
+                        assert all(d in s and s[d]["done"] for d in t["depends_on"])  # the rule always holds
+                    assert t["id"] not in t["depends_on"]
+                    assert all(d in s for d in t["depends_on"])                     # no dangling links
+                sizes.append(len(s))
+                saw_dependency.append(any(t["depends_on"] for t in s.values()))
 
     asyncio.run(go())
-    return sim, TestClient(app)
+    return sim, TestClient(app), sizes, any(saw_dependency)
 
 
-def test_simulator_creates_dependencies_and_completes_without_breaking_rules(db):
-    sim, c = run_sim(db, seed=2, ticks=300)  # seed 2 also hits a rejected delete, which is rare
-    s = state(c)
-    assert len(s) > 20
-    assert any(t["depends_on"] for t in s.values())          # some todos got dependencies
-    assert any(not t["depends_on"] for t in s.values())       # some have none
-    assert sim.by_action["complete"]["ok"] > 0                # todos got completed (and later deleted)
-    for t in s.values():                                      # the server's invariant held throughout
-        if t["done"]:
-            assert all(s[d]["done"] for d in t["depends_on"])
-        assert t["id"] not in t["depends_on"]
+def test_simulator_traffic_never_breaks_the_rules(db):
+    sim, c, sizes, saw_dependency = run_sim(db, seed=1, ticks=500)
+    a = sim.by_action
     assert sim.errors == 0
-    assert sim.by_action["complete"]["rejected"] > 0          # blocked completions were refused by the server
-    assert sim.by_action["delete"]["ok"] > 0                  # completed todos got deleted
-    assert sim.by_action["delete"]["rejected"] > 0            # deleting one that still had dependencies was refused
-    assert sim.by_action["create"]["ok"] > sim.by_action["delete"]["ok"]
     assert sim.requests == sim.ok + sim.rejected + sim.errors
+    assert a["create"]["ok"] > 20 and saw_dependency          # it creates todos, some with dependencies
+    assert a["complete"]["ok"] > 20                            # it completes todos
+    assert a["complete"]["rejected"] > 0                       # ...and the server refuses blocked ones
+    assert a["delete"]["ok"] > 20                              # it deletes completed todos
+
+
+def test_simulator_deletes_more_often_than_it_creates_and_clears_the_list(db):
+    sim, c, sizes, _ = run_sim(db, seed=1, ticks=500)
+    assert max(sizes) < 60                                     # the list stays bounded
+    assert 0 in sizes[30:]                                     # and gets cleared out now and then
+    assert sim.by_action["delete"]["ok"] >= 0.8 * sim.by_action["create"]["ok"]
+
+
+def test_simulator_deleting_a_todo_with_dependencies_is_refused_by_the_server(db):
+    sim, c, sizes, _ = run_sim(db, seed=1, ticks=500)
+    assert sim.by_action["delete"]["rejected"] > 0
 
 
 def test_simulator_is_reproducible_with_a_seed(tmp_path):
-    a, ca = run_sim(tmp_path / "a.db", seed=7, ticks=60)
-    b, cb = run_sim(tmp_path / "b.db", seed=7, ticks=60)
+    a, ca, _, _ = run_sim(tmp_path / "a.db", seed=7, ticks=60)
+    b, cb, _, _ = run_sim(tmp_path / "b.db", seed=7, ticks=60)
     assert state(ca) == state(cb)
 
 
