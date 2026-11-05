@@ -182,3 +182,37 @@ def test_database_itself_refuses_bad_links(db):
         store.db.execute("INSERT INTO dependency VALUES (?, ?)", (a, a))
     with pytest.raises(sqlite3.IntegrityError):
         store.db.execute("INSERT INTO dependency VALUES (?, ?)", (a, 999))
+
+
+# --- the positive side: when completion IS allowed ---
+
+def test_todo_with_no_dependencies_can_be_completed(c):
+    a = add(c, "a")
+    r = done(c, a)
+    assert r.status_code == 200 and r.json()["done"] is True
+    assert state(c)[a]["done"] is True
+
+
+def test_todo_can_be_completed_once_all_its_dependencies_are_complete(c):
+    a, b = add(c, "a"), add(c, "b")
+    p = add(c, "parent", [a, b])
+    done(c, a); done(c, b)
+    s = state(c)[p]
+    assert s["blocked_by"] == [] and s["can_complete"] is True
+    r = done(c, p)
+    assert r.status_code == 200 and r.json()["done"] is True
+    assert state(c)[p]["done"] is True
+
+
+def test_dependency_completed_before_the_link_is_added(c):
+    a = add(c, "a"); done(c, a)
+    b = add(c, "b", [a])  # dependency is already complete at creation
+    assert state(c)[b]["can_complete"] is True
+    assert done(c, b).status_code == 200
+
+
+def test_completing_is_idempotent(c):
+    a = add(c, "a")
+    assert done(c, a).status_code == 200
+    assert done(c, a).status_code == 200
+    assert state(c)[a]["done"] is True
