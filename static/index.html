@@ -26,6 +26,10 @@
     .error { background: #fde8e8; border: 1px solid #f3b5b5; color: #8a1c1c; border-radius: 8px; padding: 8px 12px; margin: 10px 0; display: flex; justify-content: space-between; }
     input[type=text] { padding: 8px; font-size: 15px; }
     .muted { color: #777; font-size: 13px; }
+    .panel { background: #fff; border: 1px solid #dde; border-radius: 8px; padding: 10px 14px; margin: 12px 0; font-size: 13px; }
+    .panel .row { flex-wrap: wrap; }
+    .dot { width: 9px; height: 9px; border-radius: 50%; display: inline-block; background: #2a9d4b; }
+    .dot.off { background: #c0392b; }
   </style>
 </head>
 <body>
@@ -34,6 +38,8 @@
     // This page contains NO business rules. It shows what the server returns and
     // reports the server's error messages. The server decides what is allowed.
     const { useState, useEffect } = React;
+
+    const POLL_MS = 2000; // monitoring loop: reload the list this often
 
     async function call(path, method = "GET", body) {
       const res = await fetch(`/api${path}`, {
@@ -104,14 +110,27 @@
       const [deps, setDeps] = useState([]);
       const [picking, setPicking] = useState(false);
 
-      const refresh = () => call("/todos").then(setTodos);
-      useEffect(() => { refresh().catch((e) => setError(e.message)); }, []);
+      const [sim, setSim] = useState(null);
+      const [lastUpdated, setLastUpdated] = useState(null);
+      const [connected, setConnected] = useState(true);
+
+      const refresh = async () => {
+        const [t, s] = await Promise.all([call("/todos"), call("/simulator")]);
+        setTodos(t); setSim(s); setLastUpdated(new Date()); setConnected(true);
+      };
+      // Monitoring loop: keeps the list (and simulator stats) in sync with the server.
+      useEffect(() => {
+        const tick = () => refresh().catch(() => setConnected(false));
+        tick();
+        const id = setInterval(tick, POLL_MS);
+        return () => clearInterval(id);
+      }, []);
 
       // Run an action, show any server error, then reload the server's state.
       const act = async (fn) => {
         try { await fn(); setError(null); }
         catch (e) { setError(e.message); }
-        await refresh();
+        await refresh().catch(() => setConnected(false));
       };
 
       const add = (e) => {
@@ -126,6 +145,28 @@
       return (
         <main>
           <h1>Todos</h1>
+          <div className="panel">
+            <div className="row">
+              <span className={`dot ${connected ? "" : "off"}`} />
+              <span className="grow">
+                {connected ? "Monitoring" : "Server unreachable"} · reloads every {POLL_MS / 1000}s
+                {lastUpdated && ` · updated ${lastUpdated.toLocaleTimeString()}`}
+              </span>
+            </div>
+            {sim && (
+              <div className="row" style={{ marginTop: 8 }}>
+                <strong>Traffic simulator</strong>
+                <span className="grow">
+                  {sim.running ? "running" : "stopped"} · {sim.requests} requests
+                  ({sim.ok} ok, {sim.rejected} rejected by server, {sim.errors} errors)
+                  {Object.entries(sim.by_action).map(([a, c]) => ` · ${a}: ${c.ok}/${c.rejected}/${c.errors}`)}
+                </span>
+                <button onClick={() => act(() => call(sim.running ? "/simulator/stop" : "/simulator/start", "POST"))}>
+                  {sim.running ? "Stop" : "Start"}
+                </button>
+              </div>
+            )}
+          </div>
           <form onSubmit={add}>
             <div className="row">
               <input type="text" className="grow" value={text} onChange={(e) => setText(e.target.value)}

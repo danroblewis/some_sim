@@ -29,4 +29,15 @@ The page contains no rules; it renders server state and shows the server's error
 | PUT | `/api/todos/{id}/dependencies` | `[ids]` |
 | DELETE | `/api/todos/{id}` | |
 
+## Traffic simulator and monitor
+
+- **Simulator** (`simulator.py`): a loop inside the server that sends real HTTP requests to this
+  app's own API. Each tick it lists the todos, then either creates a todo (50% chance it depends on
+  1-3 random existing todos) or tries to complete a random open todo. It knows nothing about the
+  rules, so completing a blocked todo is just a request the server rejects with 409 (counted as
+  "rejected"). It never deletes. It's off until started: use the Start/Stop button in the page, or
+  `POST /api/simulator/start?interval=1.0` / `POST /api/simulator/stop` / `GET /api/simulator`.
+- **Monitor**: the page reloads the todo list and simulator stats every 2s (`POLL_MS` in
+  `static/index.html`) and shows whether the server is reachable.
+
 Tests: `pip install -r requirements-dev.txt && pytest`

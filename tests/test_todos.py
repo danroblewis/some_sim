@@ -223,3 +223,54 @@ def test_completing_is_idempotent(c):
     assert done(c, a).status_code == 200
     assert done(c, a).status_code == 200
     assert state(c)[a]["done"] is True
+
+
+# --- traffic simulator ---
+
+def run_sim(db, seed, ticks):
+    """Run the simulator's ticks against the app in-process, over the real ASGI stack."""
+    import asyncio, random
+    import httpx
+    from simulator import Simulator
+
+    app = create_app(db)
+    sim = Simulator(random.Random(seed))
+
+    async def go():
+        async with httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://test") as client:
+            for _ in range(ticks):
+                await sim.tick(client)
+
+    asyncio.run(go())
+    return sim, TestClient(app)
+
+
+def test_simulator_creates_dependencies_and_completes_without_breaking_rules(db):
+    sim, c = run_sim(db, seed=1, ticks=300)
+    s = state(c)
+    assert len(s) > 20
+    assert any(t["depends_on"] for t in s.values())          # some todos got dependencies
+    assert any(t["done"] for t in s.values())                 # some todos got completed
+    assert any(not t["depends_on"] for t in s.values())       # some have none
+    for t in s.values():                                      # the server's invariant held throughout
+        if t["done"]:
+            assert all(s[d]["done"] for d in t["depends_on"])
+        assert t["id"] not in t["depends_on"]
+    assert sim.errors == 0
+    assert sim.by_action["complete"]["rejected"] > 0          # blocked completions were refused by the server
+    assert sim.requests == sim.ok + sim.rejected + sim.errors
+
+
+def test_simulator_is_reproducible_with_a_seed(tmp_path):
+    a, ca = run_sim(tmp_path / "a.db", seed=7, ticks=60)
+    b, cb = run_sim(tmp_path / "b.db", seed=7, ticks=60)
+    assert state(ca) == state(cb)
+
+
+def test_simulator_endpoints(db):
+    with TestClient(create_app(db)) as c:
+        assert c.get("/api/simulator").json()["running"] is False
+        assert c.post("/api/simulator/start?interval=0.05").json()["running"] is True
+        assert c.post("/api/simulator/start").json()["running"] is True  # starting twice is harmless
+        assert c.post("/api/simulator/stop").json()["running"] is False
+        assert c.post("/api/simulator/stop").json()["running"] is False

@@ -15,11 +15,14 @@ server returns and shows the server's error messages. The rules:
 import os
 import sqlite3
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, Request
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field, field_validator
+
+from simulator import Simulator
 
 DEFAULT_DB = Path(os.environ.get("TODOS_DB", Path(__file__).parent / "data" / "todos.db"))
 
@@ -233,8 +236,16 @@ class DoneBody(BaseModel):
 
 def create_app(db_path: Path | str = DEFAULT_DB) -> FastAPI:
     store = Store(db_path)
-    app = FastAPI(title="Todos with dependencies")
+    sim = Simulator()
+
+    @asynccontextmanager
+    async def lifespan(_):
+        yield
+        await sim.stop()
+
+    app = FastAPI(title="Todos with dependencies", lifespan=lifespan)
     app.state.store = store
+    app.state.sim = sim
 
     @app.exception_handler(NotFound)
     async def _nf(_, e): return _error(404, e)
@@ -264,6 +275,21 @@ def create_app(db_path: Path | str = DEFAULT_DB) -> FastAPI:
     @app.delete("/api/todos/{todo_id}", status_code=204)
     def delete_todo(todo_id: int) -> None:
         store.delete(todo_id)
+
+    # Traffic simulator: calls this app's own API over HTTP (see simulator.py)
+    @app.get("/api/simulator")
+    def simulator_status() -> dict:
+        return sim.status()
+
+    @app.post("/api/simulator/start")
+    async def simulator_start(request: Request, interval: float = 1.0) -> dict:
+        sim.start(str(request.base_url), interval)
+        return sim.status()
+
+    @app.post("/api/simulator/stop")
+    async def simulator_stop() -> dict:
+        await sim.stop()
+        return sim.status()
 
     app.mount("/", StaticFiles(directory=Path(__file__).parent / "static", html=True), name="static")
     return app
