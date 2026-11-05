@@ -246,18 +246,21 @@ def run_sim(db, seed, ticks):
 
 
 def test_simulator_creates_dependencies_and_completes_without_breaking_rules(db):
-    sim, c = run_sim(db, seed=1, ticks=300)
+    sim, c = run_sim(db, seed=2, ticks=300)  # seed 2 also hits a rejected delete, which is rare
     s = state(c)
     assert len(s) > 20
     assert any(t["depends_on"] for t in s.values())          # some todos got dependencies
-    assert any(t["done"] for t in s.values())                 # some todos got completed
     assert any(not t["depends_on"] for t in s.values())       # some have none
+    assert sim.by_action["complete"]["ok"] > 0                # todos got completed (and later deleted)
     for t in s.values():                                      # the server's invariant held throughout
         if t["done"]:
             assert all(s[d]["done"] for d in t["depends_on"])
         assert t["id"] not in t["depends_on"]
     assert sim.errors == 0
     assert sim.by_action["complete"]["rejected"] > 0          # blocked completions were refused by the server
+    assert sim.by_action["delete"]["ok"] > 0                  # completed todos got deleted
+    assert sim.by_action["delete"]["rejected"] > 0            # deleting one that still had dependencies was refused
+    assert sim.by_action["create"]["ok"] > sim.by_action["delete"]["ok"]
     assert sim.requests == sim.ok + sim.rejected + sim.errors
 
 

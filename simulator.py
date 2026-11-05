@@ -2,10 +2,12 @@
 
 Each tick it reads the list, then does ONE of:
   - create a todo, depending on 0-3 randomly chosen existing todos (50% chance of any), or
-  - try to complete a randomly chosen open todo.
+  - try to complete a randomly chosen open todo, or
+  - try to delete a randomly chosen completed todo (so finished todos don't pile up).
 
-It has no knowledge of the rules: completing a todo that is still blocked is a normal request
-that the server rejects (409). Those rejections are counted, not hidden.
+It has no knowledge of the rules: completing a blocked todo, or deleting a todo that still has
+dependencies, is a normal request that the server rejects (409). Those rejections are counted,
+not hidden.
 """
 import asyncio
 import random
@@ -100,14 +102,18 @@ class Simulator:
             return
         todos = r.json()
         open_todos = [t for t in todos if not t["done"]]
-        # Create about as often as complete (when there is something to complete).
-        action = self.rng.choice(["create", "complete"]) if open_todos else "create"
+        done_todos = [t for t in todos if t["done"]]
+        actions = ["create"] + (["complete"] if open_todos else []) + (["delete"] if done_todos else [])
+        action = self.rng.choice(actions)
         if action == "create":
             deps: list[int] = []
             if todos and self.rng.random() < 0.5:
                 deps = [t["id"] for t in self.rng.sample(todos, k=min(len(todos), self.rng.randint(1, 3)))]
             text = f"{self.rng.choice(VERBS)} {self.rng.choice(NOUNS)}"
             await self._send(client, "create", "POST", "/api/todos", json={"text": text, "depends_on": deps})
-        else:
+        elif action == "complete":
             target = self.rng.choice(open_todos)  # may still be blocked: the server decides
             await self._send(client, "complete", "PUT", f"/api/todos/{target['id']}/done", json={"done": True})
+        else:
+            target = self.rng.choice(done_todos)  # may still have dependencies: the server decides
+            await self._send(client, "delete", "DELETE", f"/api/todos/{target['id']}")
